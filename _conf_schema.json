@@ -26,6 +26,34 @@
     "default": true,
     "hint": "开启后，插件在处理磁链时会给原消息贴表情以示响应。"
   },
+  "local_metadata_enabled": {
+    "description": "优先使用本地 DHT 元数据",
+    "type": "bool",
+    "default": true,
+    "hint": "只获取经过 InfoHash 校验的名称、大小和文件列表，不下载资源正文。失败时回退到 WhatsLink。"
+  },
+  "local_metadata_timeout": {
+    "description": "本地元数据解析超时秒数",
+    "type": "int",
+    "default": 45,
+    "slider": {
+      "min": 5,
+      "max": 120,
+      "step": 5
+    },
+    "hint": "冷门磁链可能需要更长时间从 DHT 找到节点。"
+  },
+  "local_metadata_file_limit": {
+    "description": "显示主要文件数量",
+    "type": "int",
+    "default": 8,
+    "slider": {
+      "min": 0,
+      "max": 20,
+      "step": 1
+    },
+    "hint": "按文件大小排序，仅影响消息展示，不影响元数据准确性。设置为 0 时不展示文件清单。"
+  },
   "max_magnet_count": {
     "description": "单次消息最多解析磁链数量",
     "type": "int",

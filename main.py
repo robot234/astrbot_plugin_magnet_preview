@@ -14,6 +14,8 @@ from astrbot.api.star import Star, Context
 import astrbot.api.message_components as Comp
 from astrbot.api.message_components import Plain, Node, Nodes
 
+from .local_metadata import LocalMetadataResolver
+
 DEFAULT_WHATSLINK_URL = "https://whatslink.info"
 DEFAULT_TIMEOUT = 10
 MAX_FORWARD_DEPTH = 5
@@ -47,6 +49,15 @@ class MagnetPreviewer(Star):
             str(sid) for sid in config.get("session_whitelist", [])
         ]
         self.loose_match = config.get("loose_match", False)
+        self.local_metadata_enabled = bool(config.get("local_metadata_enabled", True))
+        self.local_metadata_file_limit = max(
+            0, min(20, int(config.get("local_metadata_file_limit", 8)))
+        )
+        self.local_metadata = LocalMetadataResolver(
+            timeout=float(config.get("local_metadata_timeout", 45)),
+        )
+        if self.local_metadata_enabled:
+            self.local_metadata.start()
 
         self.whatslink_url = DEFAULT_WHATSLINK_URL
         self.api_url = f"{self.whatslink_url}/api/v1/link"
@@ -67,6 +78,7 @@ class MagnetPreviewer(Star):
         self._link_cache: dict = {}
 
     async def terminate(self):
+        self.local_metadata.close()
         logger.info("磁链预览插件已终止")
         await super().terminate()
 
@@ -475,7 +487,18 @@ class MagnetPreviewer(Star):
         """统一的磁链处理和展示流程"""
         all_results = []
         for link in links:
-            data = await self._fetch_magnet_info(link)
+            local_task = (
+                self.local_metadata.resolve(link)
+                if self.local_metadata_enabled
+                and self.local_metadata.available
+                and link.lower().startswith("magnet:")
+                else asyncio.sleep(0, result=None)
+            )
+            local_data, whatslink_data = await asyncio.gather(
+                local_task,
+                self._fetch_magnet_info(link),
+            )
+            data = self._merge_metadata(local_data, whatslink_data)
 
             if (
                 not data
@@ -725,13 +748,35 @@ class MagnetPreviewer(Star):
 
     def _sort_infos_and_get_urls(self, info: dict) -> Tuple[List[str], List[str]]:
         file_type = str(info.get("file_type", "unknown")).lower()
+        metadata_source = info.get("metadata_source")
+        source_text = (
+            "本地 DHT（InfoHash 校验）"
+            if metadata_source == "local_dht"
+            else "WhatsLink"
+        )
         base_info = [
             "🔍 解析结果：",
             f"📝 名称：{info.get('name', '未知')}",
             f"📦 类型：{FILE_TYPE_MAP.get(file_type, FILE_TYPE_MAP['unknown'])}",
             f"📏 大小：{self._format_file_size(info.get('size', 0))}",
             f"📚 包含文件：{info.get('count', 0)}个",
+            f"🧭 元数据：{source_text}",
         ]
+
+        files = info.get("files")
+        if isinstance(files, list) and self.local_metadata_file_limit > 0:
+            base_info.append("\n📂 主要文件：")
+            for item in files[: self.local_metadata_file_limit]:
+                if not isinstance(item, dict):
+                    continue
+                path = str(item.get("path", "") or "").strip()
+                if path:
+                    base_info.append(
+                        f"- {path} ({self._format_file_size(item.get('size', 0))})"
+                    )
+            hidden_count = len(files) - self.local_metadata_file_limit
+            if hidden_count > 0:
+                base_info.append(f"- 其余 {hidden_count} 个文件未显示")
 
         screenshots_urls = []
         raw_screenshots = info.get("screenshots")
@@ -745,6 +790,28 @@ class MagnetPreviewer(Star):
                     logger.debug("跳过一张无效的截图数据。")
                     continue
         return base_info, screenshots_urls
+
+    @staticmethod
+    def _merge_metadata(
+        local_data: Dict | None, whatslink_data: Dict | None
+    ) -> Dict | None:
+        """Prefer hash-authenticated local metadata and retain remote screenshots."""
+        remote_valid = (
+            isinstance(whatslink_data, dict)
+            and not whatslink_data.get("error")
+        )
+        if local_data:
+            merged = dict(whatslink_data) if remote_valid else {}
+            merged.update(local_data)
+            if remote_valid and isinstance(whatslink_data.get("screenshots"), list):
+                merged["screenshots"] = whatslink_data["screenshots"]
+            return merged
+
+        if remote_valid:
+            fallback = dict(whatslink_data)
+            fallback["metadata_source"] = "whatslink"
+            return fallback
+        return whatslink_data if isinstance(whatslink_data, dict) else None
 
     def _format_text_result(self, infos: List[str], screenshots_urls: List[str]) -> str:
         """生成纯文本回复，包含截图链接"""

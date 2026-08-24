@@ -2,6 +2,8 @@
 
 # 🧲 磁链预览助手
 
+本仓库基于 [Foolllll-J/astrbot_plugin_magnet_preview](https://github.com/Foolllll-J/astrbot_plugin_magnet_preview)，增加本地 DHT 权威元数据解析，并保留 WhatsLink 截图与兜底能力。
+
 <i>🔍 一键解析磁链，资源尽在掌握</i>
 
 ![License](https://img.shields.io/badge/license-AGPL--3.0-green?style=flat-square)
@@ -19,6 +21,10 @@
 ---
 
 ## ✨ 功能特性
+
+- **本地权威元数据**：优先通过 libtorrent DHT 获取经 InfoHash 校验的名称、精确大小和文件列表，不下载资源正文。
+- **混合解析**：本地无节点或超时时自动回退 WhatsLink，并继续使用 WhatsLink 的预览截图。
+- **轻量缓存**：元数据仅保存在内存中，默认最多 256 条，不缓存视频或其他资源文件。
 
 * **🚀 自动触发**: 智能检测消息中的磁力链接或 40 位 InfoHash 并自动解析预览。
 * **🔢 多链支持**: 支持单条消息内解析多个磁链，解析结果通过合并转发节点清晰展示。
