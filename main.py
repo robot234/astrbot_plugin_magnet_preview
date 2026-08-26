@@ -943,7 +943,8 @@ class MagnetPreviewer(Star):
 
             task.add_done_callback(remove_inflight)
 
-        return await asyncio.shield(task)
+        data = await asyncio.shield(task)
+        return copy.deepcopy(data) if isinstance(data, dict) else data
 
     async def _fetch_and_cache_whatslink_info(
         self, cache_key: str, magnet_link: str
