@@ -25,7 +25,7 @@ WHATSLINK_MAX_ATTEMPTS = 3
 WHATSLINK_RETRY_DELAYS = (0.5, 1.0)
 WHATSLINK_CACHE_TTL = 15 * 60
 WHATSLINK_CACHE_LIMIT = 128
-WHATSLINK_RETRY_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+WHATSLINK_RETRY_STATUSES = {408, 425, 429}
 
 FILE_TYPE_MAP = {
     "folder": "📁 文件夹",
@@ -804,8 +804,8 @@ class MagnetPreviewer(Star):
         if isinstance(raw_screenshots, list) and self.max_screenshots > 0:
             for s in raw_screenshots[: self.max_screenshots]:
                 try:
-                    url = self.replace_image_url(s["screenshot"])
-                    if url:
+                    url = str(self.replace_image_url(s["screenshot"]) or "").strip()
+                    if url.lower().startswith(("http://", "https://")):
                         screenshots_urls.append(url)
                 except (TypeError, KeyError):
                     logger.debug("跳过一张无效的截图数据。")
@@ -920,6 +920,23 @@ class MagnetPreviewer(Star):
         while len(self._whatslink_cache) > WHATSLINK_CACHE_LIMIT:
             self._whatslink_cache.popitem(last=False)
 
+    def _is_cacheable_whatslink_info(self, data: Dict, magnet_link: str) -> bool:
+        if data.get("error") or self._is_unresolved_parse_result(data, magnet_link):
+            return False
+
+        name = str(data.get("name", "") or "").strip()
+        screenshots = data.get("screenshots")
+        if name or (isinstance(screenshots, list) and screenshots):
+            return True
+
+        for field in ("size", "count"):
+            try:
+                if int(data.get(field, 0) or 0) > 0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
+
     async def _fetch_magnet_info(self, magnet_link: str) -> Dict | None:
         """获取 WhatsLink 结果，合并同一哈希的请求并复用内存缓存。"""
         cache_key = self._get_whatslink_cache_key(magnet_link)
@@ -952,8 +969,7 @@ class MagnetPreviewer(Star):
         data = await self._fetch_whatslink_with_retry(magnet_link)
         if (
             isinstance(data, dict)
-            and not data.get("error")
-            and not self._is_unresolved_parse_result(data, magnet_link)
+            and self._is_cacheable_whatslink_info(data, magnet_link)
         ):
             self._cache_whatslink_info(cache_key, data)
         return data
@@ -979,7 +995,10 @@ class MagnetPreviewer(Star):
                     ) as resp:
                         if resp.status == 200:
                             return await resp.json(content_type=None)
-                        should_retry = resp.status in WHATSLINK_RETRY_STATUSES
+                        should_retry = (
+                            resp.status in WHATSLINK_RETRY_STATUSES
+                            or 500 <= resp.status <= 599
+                        )
                         if not should_retry:
                             logger.warning(
                                 f"WhatsLink 请求失败，状态码：{resp.status}"
