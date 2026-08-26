@@ -517,7 +517,7 @@ class MagnetPreviewer(Star):
                     )
                 )
             else:
-                infos, screenshots_urls = self._sort_infos_and_get_urls(data)
+                infos, screenshots_urls = self._sort_infos_and_get_urls(data, link)
                 all_results.append((infos, screenshots_urls))
 
         if not all_results:
@@ -746,7 +746,9 @@ class MagnetPreviewer(Star):
         """将文本按指定长度分割成一个字符串列表"""
         return [text[i : i + max_length] for i in range(0, len(text), max_length)]
 
-    def _sort_infos_and_get_urls(self, info: dict) -> Tuple[List[str], List[str]]:
+    def _sort_infos_and_get_urls(
+        self, info: dict, parsed_link: str
+    ) -> Tuple[List[str], List[str]]:
         file_type = str(info.get("file_type", "unknown")).lower()
         metadata_source = info.get("metadata_source")
         source_text = (
@@ -762,6 +764,9 @@ class MagnetPreviewer(Star):
             f"📚 包含文件：{info.get('count', 0)}个",
             f"🧭 元数据：{source_text}",
         ]
+
+        if parsed_link.lower().startswith("magnet:"):
+            base_info.append(f"🧲 磁链：{parsed_link}")
 
         files = info.get("files")
         if isinstance(files, list) and self.local_metadata_file_limit > 0:
