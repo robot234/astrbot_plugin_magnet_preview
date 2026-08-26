@@ -3,7 +3,9 @@ import math
 import json
 import asyncio
 import time
+import copy
 import aiohttp
+from collections import OrderedDict
 from io import BytesIO
 from typing import Any, AsyncGenerator, Dict, List, Tuple
 from PIL import Image, ImageFilter
@@ -19,6 +21,11 @@ from .local_metadata import LocalMetadataResolver
 DEFAULT_WHATSLINK_URL = "https://whatslink.info"
 DEFAULT_TIMEOUT = 10
 MAX_FORWARD_DEPTH = 5
+WHATSLINK_MAX_ATTEMPTS = 3
+WHATSLINK_RETRY_DELAYS = (0.5, 1.0)
+WHATSLINK_CACHE_TTL = 15 * 60
+WHATSLINK_CACHE_LIMIT = 128
+WHATSLINK_RETRY_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 
 FILE_TYPE_MAP = {
     "folder": "📁 文件夹",
@@ -76,8 +83,17 @@ class MagnetPreviewer(Star):
             r"\b(?:https?://|www\.)[^\s<>'\"`]+", re.IGNORECASE
         )
         self._link_cache: dict = {}
+        self._whatslink_cache: OrderedDict[str, Tuple[float, Dict]] = OrderedDict()
+        self._whatslink_inflight: Dict[str, asyncio.Task] = {}
 
     async def terminate(self):
+        inflight_tasks = list(self._whatslink_inflight.values())
+        self._whatslink_inflight.clear()
+        self._whatslink_cache.clear()
+        for task in inflight_tasks:
+            task.cancel()
+        if inflight_tasks:
+            await asyncio.gather(*inflight_tasks, return_exceptions=True)
         self.local_metadata.close()
         logger.info("磁链预览插件已终止")
         await super().terminate()
@@ -794,6 +810,8 @@ class MagnetPreviewer(Star):
                 except (TypeError, KeyError):
                     logger.debug("跳过一张无效的截图数据。")
                     continue
+        if self.max_screenshots > 0 and not screenshots_urls:
+            base_info.append("📸 预览截图：暂无可用截图")
         return base_info, screenshots_urls
 
     @staticmethod
@@ -873,33 +891,112 @@ class MagnetPreviewer(Star):
             if part_text:
                 yield event.plain_result(part_text)
 
+    def _get_whatslink_cache_key(self, link: str) -> str | None:
+        magnet_match = self._magnet_regex.search(link or "")
+        if magnet_match:
+            return f"magnet:{magnet_match.group(1).upper()}"
+
+        ed2k_match = self._ed2k_regex.search(link or "")
+        if ed2k_match:
+            return f"ed2k:{ed2k_match.group(3).upper()}"
+        return None
+
+    def _get_cached_whatslink_info(self, cache_key: str) -> Dict | None:
+        cached = self._whatslink_cache.get(cache_key)
+        if not cached:
+            return None
+
+        created_at, data = cached
+        if time.monotonic() - created_at >= WHATSLINK_CACHE_TTL:
+            self._whatslink_cache.pop(cache_key, None)
+            return None
+
+        self._whatslink_cache.move_to_end(cache_key)
+        return copy.deepcopy(data)
+
+    def _cache_whatslink_info(self, cache_key: str, data: Dict) -> None:
+        self._whatslink_cache[cache_key] = (time.monotonic(), copy.deepcopy(data))
+        self._whatslink_cache.move_to_end(cache_key)
+        while len(self._whatslink_cache) > WHATSLINK_CACHE_LIMIT:
+            self._whatslink_cache.popitem(last=False)
+
     async def _fetch_magnet_info(self, magnet_link: str) -> Dict | None:
-        """异步调用Whatslink API获取磁力信息"""
+        """获取 WhatsLink 结果，合并同一哈希的请求并复用内存缓存。"""
+        cache_key = self._get_whatslink_cache_key(magnet_link)
+        if not cache_key:
+            return await self._fetch_whatslink_with_retry(magnet_link)
+
+        cached = self._get_cached_whatslink_info(cache_key)
+        if cached is not None:
+            return cached
+
+        task = self._whatslink_inflight.get(cache_key)
+        if task is None:
+            task = asyncio.create_task(
+                self._fetch_and_cache_whatslink_info(cache_key, magnet_link)
+            )
+            self._whatslink_inflight[cache_key] = task
+
+            def remove_inflight(completed_task: asyncio.Task) -> None:
+                if self._whatslink_inflight.get(cache_key) is completed_task:
+                    self._whatslink_inflight.pop(cache_key, None)
+
+            task.add_done_callback(remove_inflight)
+
+        return await asyncio.shield(task)
+
+    async def _fetch_and_cache_whatslink_info(
+        self, cache_key: str, magnet_link: str
+    ) -> Dict | None:
+        data = await self._fetch_whatslink_with_retry(magnet_link)
+        if (
+            isinstance(data, dict)
+            and not data.get("error")
+            and not self._is_unresolved_parse_result(data, magnet_link)
+        ):
+            self._cache_whatslink_info(cache_key, data)
+        return data
+
+    async def _fetch_whatslink_with_retry(self, magnet_link: str) -> Dict | None:
+        """仅对暂态网络和服务端错误进行有限重试。"""
         params = {"url": magnet_link}
         headers = {
             "Accept": "application/json",
             "User-Agent": "Mozilla/5.0 (MagnetPreviewer)",
         }
+        timeout = aiohttp.ClientTimeout(total=DEFAULT_TIMEOUT)
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    self.api_url,
-                    params=params,
-                    headers=headers,
-                    ssl=False,
-                    timeout=DEFAULT_TIMEOUT,
-                ) as resp:
-                    if resp.status != 200:
-                        logger.error(f"API request failed with status: {resp.status}")
-                        return None
-                    return await resp.json()
-        except aiohttp.ClientError as e:
-            logger.error(f"Network error during API call: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"An unexpected error occurred during fetch: {e}")
-            return None
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for attempt in range(WHATSLINK_MAX_ATTEMPTS):
+                should_retry = False
+                try:
+                    async with session.get(
+                        self.api_url,
+                        params=params,
+                        headers=headers,
+                        ssl=False,
+                    ) as resp:
+                        if resp.status == 200:
+                            return await resp.json(content_type=None)
+                        should_retry = resp.status in WHATSLINK_RETRY_STATUSES
+                        if not should_retry:
+                            logger.warning(
+                                f"WhatsLink 请求失败，状态码：{resp.status}"
+                            )
+                            return None
+                        logger.warning(
+                            f"WhatsLink 暂时不可用，状态码：{resp.status}"
+                        )
+                except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
+                    should_retry = True
+                    logger.warning(
+                        f"WhatsLink 请求异常：{type(error).__name__}"
+                    )
+
+                if should_retry and attempt < WHATSLINK_MAX_ATTEMPTS - 1:
+                    await asyncio.sleep(WHATSLINK_RETRY_DELAYS[attempt])
+
+        return None
 
     def _is_unresolved_parse_result(self, info: Dict | None, link: str) -> bool:
         """识别上游接口未真正解析出资源信息时返回的占位结果。"""
